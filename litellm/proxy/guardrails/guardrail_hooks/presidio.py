@@ -29,6 +29,7 @@ from litellm.constants import (
     DEFAULT_PRESIDIO_ANALYZE_CHUNK_SIZE_BYTES,
     PRESIDIO_ANALYZE_CHUNK_CONCURRENCY,
     PRESIDIO_ANALYZE_CHUNK_OVERLAP_CHARS,
+    PRESIDIO_MAX_CONCURRENT_REQUESTS,
 )
 from litellm.litellm_core_utils.core_helpers import attribute_items, attribute_or_none
 from litellm.types.utils import GenericGuardrailAPIInputs
@@ -99,6 +100,10 @@ def _write_attribute(target: object, name: str, value: object) -> None:
 
 
 _LoopSemaphores = dict[asyncio.AbstractEventLoop, asyncio.Semaphore]
+
+
+def _new_analyzer_session() -> aiohttp.ClientSession:
+    return aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=PRESIDIO_MAX_CONCURRENT_REQUESTS))
 
 
 def _json_escaped_len(text: str) -> int:
@@ -246,9 +251,6 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         self.presidio_analyze_chunk_size_bytes: int = self._coerce_analyze_chunk_size(presidio_analyze_chunk_size_bytes)
         # Shared HTTP session to prevent memory leaks (issue #14540)
         self._http_session: aiohttp.ClientSession | None = None
-        # Lock to prevent race conditions when creating session under concurrent load
-        # Note: asyncio.Lock() can be created without an event loop; it only needs one when awaited
-        self._session_lock: asyncio.Lock = asyncio.Lock()
 
         # Track main thread ID to safely identity when we are running in main loop vs background thread
 
@@ -323,7 +325,7 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
 
         Logic:
         1. If running in the main thread (where the object was initialized/destined to live normally),
-           use the shared `self._http_session` (protected by a lock).
+           use the shared `self._http_session`.
         2. If running in a background thread (e.g. logging hook), use a cached session for that loop.
         """
         current_loop: Final = asyncio.get_running_loop()
@@ -331,16 +333,15 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         # Check if we are in the stored main thread
         if threading.get_ident() == self._main_thread_id:
             # Main thread -> use shared session
-            async with self._session_lock:
-                if self._http_session is None or self._http_session.closed:
-                    self._http_session = aiohttp.ClientSession()
-                yield self._http_session
+            if self._http_session is None or self._http_session.closed:
+                self._http_session = _new_analyzer_session()
+            yield self._http_session
         else:
             # Background thread/loop -> use loop-bound session cache
             # This avoids "attached to a different loop" or "no running event loop" errors
             # when accessing the shared session created in the main loop
             if current_loop not in self._loop_sessions or self._loop_sessions[current_loop].closed:
-                self._loop_sessions[current_loop] = aiohttp.ClientSession()
+                self._loop_sessions[current_loop] = _new_analyzer_session()
             yield self._loop_sessions[current_loop]
 
     async def _close_http_session(self) -> None:
@@ -583,9 +584,7 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         # The semaphore is shared per event loop across every chunked call on
         # this instance, so many oversized blocks in one request (or many
         # concurrent requests) still hold at most this many analyzer calls in
-        # flight. On the proxy's main thread the shared-session lock in
-        # _get_session_iterator additionally serializes the HTTP calls; the
-        # bound matters for loop-bound sessions (background threads).
+        # flight.
         analyze_semaphore: Final = self._get_chunk_semaphore()
 
         async def _analyze_chunk_bounded(

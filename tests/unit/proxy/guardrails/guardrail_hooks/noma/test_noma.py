@@ -83,7 +83,7 @@ async def test_standard_logging_payload_includes_guardrail_information():
     call_counter = {"count": 0}
 
     class MockClientSession:
-        def __init__(self):
+        def __init__(self, connector=None):
             self.closed = False
 
         async def __aenter__(self):

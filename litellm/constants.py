@@ -463,6 +463,7 @@ CONTENT_FILTER_STREAMING_SCAN_CONTEXT_CHARS: Final = 512
 DEFAULT_PRESIDIO_ANALYZE_CHUNK_SIZE_BYTES: Final = 500_000
 PRESIDIO_ANALYZE_CHUNK_OVERLAP_CHARS: Final = 4096
 PRESIDIO_ANALYZE_CHUNK_CONCURRENCY: Final = 8
+PRESIDIO_MAX_CONCURRENT_REQUESTS: Final = get_env_int_in_range("PRESIDIO_MAX_CONCURRENT_REQUESTS", 8, 1, 1000)
 # Aggregation threshold: default to 80% of the asyncio queue maxsize so the check can always trigger.
 # Must be < LITELLM_ASYNCIO_QUEUE_MAXSIZE; if set higher the aggregation logic will never fire.
 MAX_SIZE_IN_MEMORY_QUEUE: Final = get_env_int("MAX_SIZE_IN_MEMORY_QUEUE", int(LITELLM_ASYNCIO_QUEUE_MAXSIZE * 0.8))

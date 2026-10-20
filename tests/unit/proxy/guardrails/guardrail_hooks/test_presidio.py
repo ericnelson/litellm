@@ -26,6 +26,7 @@ from typing_extensions import ReadOnly, TypedDict
 import litellm
 from litellm import mock_completion
 from litellm.caching.caching import DualCache
+from litellm.constants import PRESIDIO_MAX_CONCURRENT_REQUESTS
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.guardrails.guardrail_hooks.presidio import (
     PresidioPerRequestConfig,
@@ -4830,3 +4831,49 @@ def test_get_session_iterator_reuses_one_session_per_background_loop(
     assert len(sessions) == 10
     assert all(session is sessions[0] for session in sessions)
     assert presidio_guardrail._http_session is None
+
+
+class _GatedAnalyzer:
+    """Holds every /analyze request until released, recording how many were open at once."""
+
+    def __init__(self, saturation: int) -> None:
+        self._saturation: Final = saturation
+        self.open_requests = 0
+        self.peak_open_requests = 0
+        self.saturated: Final = asyncio.Event()
+        self.release: Final = asyncio.Event()
+
+    async def analyze(self, request: web.Request) -> web.Response:
+        self.open_requests += 1
+        self.peak_open_requests = max(self.peak_open_requests, self.open_requests)
+        if self.open_requests >= self._saturation:
+            self.saturated.set()
+        await self.release.wait()
+        self.open_requests -= 1
+        return web.json_response([])
+
+
+@pytest.mark.asyncio
+async def test_analyze_requests_run_concurrently_up_to_the_connection_limit() -> None:
+    limit: Final = PRESIDIO_MAX_CONCURRENT_REQUESTS
+    analyzer: Final = _GatedAnalyzer(saturation=limit)
+    app: Final = web.Application()
+    app.router.add_post("/analyze", analyzer.analyze)
+    async with TestServer(app) as server:
+        guardrail: Final = OPTIONAL_PresidioPIIMasking(
+            presidio_analyzer_api_base=str(server.make_url("/")),
+            presidio_anonymizer_api_base=str(server.make_url("/")),
+            pii_entities_config={PiiEntityType.PERSON: PiiAction.MASK},
+        )
+        scans: Final = tuple(
+            asyncio.create_task(guardrail.analyze_text(text=f"message {index}", presidio_config=None, request_data={}))
+            for index in range(limit * 3)
+        )
+        await asyncio.wait_for(analyzer.saturated.wait(), timeout=30)
+        for _ in range(100):
+            await asyncio.sleep(0)
+        analyzer.release.set()
+        await asyncio.gather(*scans)
+        await guardrail._close_http_session()
+
+    assert analyzer.peak_open_requests == limit
