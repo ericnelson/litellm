@@ -1739,25 +1739,33 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         texts: Final = inputs.get("texts", [])
 
         metadata: Final = (request_data.get("metadata") or {}) if request_data else {}
-        pii_tokens: Final = metadata.get("pii_tokens", {})
+        pii_tokens: Final = cast("dict[str, str]", metadata.get("pii_tokens", {}))  # cast-ok: this hook's map
 
-        new_texts: Final = []
-        if input_type == "response" and (
+        unmask_response: Final = input_type == "response" and (
             self._callback_role == "restore"
-            or (self._callback_role is None and not self.apply_to_output and pii_tokens)
-        ):
-            for text in texts:
-                new_texts.append(self._unmask_pii_text(text, pii_tokens))
-        else:
-            for text in texts:
-                modified_text = await self.check_pii(
-                    text=text,
-                    output_parse_pii=self.output_parse_pii,
-                    presidio_config=None,
-                    request_data=request_data or {},
+            or (self._callback_role is None and not self.apply_to_output and bool(pii_tokens))
+        )
+        try:
+            inputs["texts"] = (
+                [self._unmask_pii_text(text, pii_tokens) for text in texts]
+                if unmask_response
+                else list(
+                    await asyncio.gather(
+                        *(
+                            self.check_pii(
+                                text=text,
+                                output_parse_pii=self.output_parse_pii,
+                                presidio_config=None,
+                                request_data=request_data or {},
+                            )
+                            for text in texts
+                        )
+                    )
                 )
-                new_texts.append(modified_text)
-        inputs["texts"] = new_texts
+            )
+        finally:
+            if texts and not unmask_response:
+                self.mark_guardrail_information_recorded()
         return inputs
 
     def update_in_memory_litellm_params(self, litellm_params: LitellmParams) -> None:

@@ -1441,6 +1441,17 @@ class CustomGuardrail(CustomLogger):
         except Exception:
             pass
 
+    @staticmethod
+    def mark_guardrail_information_recorded() -> None:
+        """
+        Tell `log_guardrail_information` that this guardrail already recorded its own entries.
+
+        `add_standard_logging_guardrail_information_to_request_data` does this itself, but asyncio runs
+        gathered tasks in a copy of the context, so a guardrail that records from inside `asyncio.gather`
+        must call this in the awaiting task, otherwise the decorator records a second entry.
+        """
+        _guardrail_self_recorded.set(True)
+
     async def apply_guardrail(
         self,
         inputs: GenericGuardrailAPIInputs,

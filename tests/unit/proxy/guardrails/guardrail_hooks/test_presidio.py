@@ -4877,3 +4877,75 @@ async def test_analyze_requests_run_concurrently_up_to_the_connection_limit() ->
         await guardrail._close_http_session()
 
     assert analyzer.peak_open_requests == limit
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_scans_texts_concurrently() -> None:
+    texts: Final = ["first message", "second message", "third message"]
+    analyzer: Final = _GatedAnalyzer(saturation=len(texts))
+    app: Final = web.Application()
+    app.router.add_post("/analyze", analyzer.analyze)
+    async with TestServer(app) as server:
+        guardrail: Final = OPTIONAL_PresidioPIIMasking(
+            presidio_analyzer_api_base=str(server.make_url("/")),
+            presidio_anonymizer_api_base=str(server.make_url("/")),
+            pii_entities_config={PiiEntityType.PERSON: PiiAction.MASK},
+        )
+        scan: Final = asyncio.create_task(
+            guardrail.apply_guardrail(
+                inputs={"texts": list(texts)}, request_data={"model": "gpt-5-mini"}, input_type="request"
+            )
+        )
+        await asyncio.wait_for(analyzer.saturated.wait(), timeout=30)
+        analyzer.release.set()
+        result: Final = await scan
+        await guardrail._close_http_session()
+
+    assert result["texts"] == texts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("texts", "blocked", "recorded_entries"),
+    [
+        pytest.param(("one", "two", "three"), False, 3, id="each_scan_is_recorded_once"),
+        pytest.param((f"card {_CARD_NUMBER}",), True, 1, id="a_blocked_scan_is_recorded_once"),
+        pytest.param((), False, 1, id="no_scans_keep_the_single_default_entry"),
+    ],
+)
+async def test_apply_guardrail_records_one_entry_per_scan(
+    texts: tuple[str, ...], blocked: bool, recorded_entries: int
+) -> None:
+    analyzed: Final[asyncio.Queue[PresidioAnalyzeRequest]] = asyncio.Queue()
+    guardrail: Final = _guardrail_with_in_memory_presidio(analyzed)
+    request_data: Final = {"model": "gpt-5-mini"}
+    try:
+        scan: Final = guardrail.apply_guardrail(
+            inputs={"texts": list(texts)}, request_data=request_data, input_type="request"
+        )
+        if blocked:
+            with pytest.raises(BlockedPiiEntityError):
+                await scan
+        else:
+            await scan
+    finally:
+        await guardrail._close_http_session()
+
+    assert len(request_data["metadata"]["standard_logging_guardrail_information"]) == recorded_entries
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_restoring_a_response_keeps_the_single_default_entry() -> None:
+    guardrail: Final = OPTIONAL_PresidioPIIMasking(
+        mock_testing=True,
+        pii_entities_config={PiiEntityType.PERSON: PiiAction.MASK},
+        _callback_role="restore",
+    )
+    request_data: Final = {"model": "gpt-5-mini", "metadata": {"pii_tokens": {"<PERSON_1>": "John Smith"}}}
+
+    result: Final = await guardrail.apply_guardrail(
+        inputs={"texts": ["Hello <PERSON_1>"]}, request_data=request_data, input_type="response"
+    )
+
+    assert result["texts"] == ["Hello John Smith"]
+    assert len(request_data["metadata"]["standard_logging_guardrail_information"]) == 1
