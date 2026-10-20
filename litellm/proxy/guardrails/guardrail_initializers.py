@@ -171,7 +171,11 @@ def initialize_presidio(litellm_params: LitellmParams, guardrail: Guardrail) -> 
         litellm.logging_callback_manager.add_litellm_callback(callback)
         return callback
 
-    input_callback: Final = _make_presidio_callback() if run_input else None
+    input_callback: Final = (
+        _make_presidio_callback(only_scan_new_messages=litellm_params.only_scan_new_messages or False)
+        if run_input
+        else None
+    )
     unmask_output_callback: Final = (
         _make_presidio_callback(
             output_parse_pii=True,

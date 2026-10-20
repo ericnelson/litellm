@@ -529,22 +529,50 @@ class CustomGuardrail(CustomLogger):
         """
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
+    def _incremental_scan_policy_fingerprint(self) -> str:
+        """Identity of the rules the scan enforces, empty leaves the cache key as before.
+
+        A guardrail that returns a hash of its effective rules starts a fresh per-session
+        cache whenever those rules change under the same guardrail name.
+        """
+        return ""
+
     def _scanned_texts_cache_key(self, session_id: str) -> str:
+        fingerprint: Final = self._incremental_scan_policy_fingerprint()
+        if fingerprint:
+            return f"guardrail_scanned_texts:{self.guardrail_name}:{fingerprint}:{session_id}"
         return f"guardrail_scanned_texts:{self.guardrail_name}:{session_id}"
+
+    @staticmethod
+    def _incremental_scan_cache() -> DualCache:
+        """Resolve the cache used to remember which segments a session already scanned.
+
+        Prefers the proxy's shared cache (``internal_usage_cache.dual_cache``), which is
+        backed by Redis when the deployment configures it, so incremental state is shared
+        across proxy instances. Falls back to a process-local ``DualCache`` singleton when
+        the proxy is not running (e.g. unit tests), where sharing does not apply.
+        """
+        try:
+            from litellm.proxy.proxy_server import proxy_logging_obj as _proxy_logging
+        except Exception:  # noqa: BLE001  # proxy not importable outside the server; use local fallback
+            return dc
+        if _proxy_logging is not None:
+            return _proxy_logging.internal_usage_cache.dual_cache
+        return dc
 
     @with_service_target(GUARDRAIL_SESSIONS_TARGET)
     async def filter_new_texts_for_session(
         self,
-        texts: list[str] | None,
+        texts: Sequence[str] | None,
         request_data: dict[str, object],
         cache: DualCache,
-    ) -> list[str] | None:
+    ) -> Sequence[str] | None:
         """Return only the text segments not already scanned earlier in this session.
 
         Returns ``None`` when incremental scanning is inactive (feature off, no
         session id, masking enabled, or the cache read failed). ``None`` signals
         the caller to fall back to a full scan; a returned list (possibly empty)
-        signals the caller to scan only that subset and skip masking write-back.
+        signals the caller to scan only that subset.
         """
         if not self.only_scan_new_messages or not texts:
             return None
@@ -580,7 +608,7 @@ class CustomGuardrail(CustomLogger):
     @with_service_target(GUARDRAIL_SESSIONS_TARGET)
     async def mark_texts_scanned(
         self,
-        texts: list[str] | None,
+        texts: Sequence[str] | None,
         request_data: dict[str, object],
         cache: DualCache,
     ) -> None:
@@ -1125,6 +1153,14 @@ class CustomGuardrail(CustomLogger):
         silently scanning nothing on every request.
         """
         return True
+
+    def supports_only_scan_new_messages(self) -> bool:
+        """Whether this guardrail scans only the per-session diff.
+
+        A guardrail that wires ``filter_new_texts_for_session`` and ``mark_texts_scanned`` returns
+        True when its current configuration is safe to skip already scanned context.
+        """
+        return False
 
     def structured_messages_cover_full_request(self) -> bool:
         """Whether returned ``structured_messages`` span the whole request.

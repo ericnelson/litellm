@@ -9,6 +9,7 @@
 
 
 import asyncio
+import hashlib
 import json
 import re
 import threading
@@ -234,6 +235,7 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         self.output_parse_pii = output_parse_pii or False
         self.apply_to_output = apply_to_output
         self._callback_role = _callback_role
+        self._warn_if_only_scan_new_messages_unsupported()
 
         # When output_parse_pii or apply_to_output is enabled, the guardrail must
         # also run on post_call to unmask/mask the response.  Expand the event_hook
@@ -1745,28 +1747,68 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
             self._callback_role == "restore"
             or (self._callback_role is None and not self.apply_to_output and bool(pii_tokens))
         )
+        inputs["texts"] = (
+            [self._unmask_pii_text(text, pii_tokens) for text in texts]
+            if unmask_response
+            else list(await self._scan_texts(texts=texts, request_data=request_data or {}, input_type=input_type))
+        )
+        return inputs
+
+    async def _scan_texts(
+        self, texts: Sequence[str], request_data: dict[str, object], input_type: Literal["request", "response"]
+    ) -> tuple[str, ...]:
+        cache: Final = self._incremental_scan_cache()
+        unseen: Final = (
+            await self.filter_new_texts_for_session(texts=texts, request_data=request_data, cache=cache)
+            if input_type == "request" and self.supports_only_scan_new_messages()
+            else None
+        )
+        unseen_texts: Final = frozenset(texts if unseen is None else unseen)
+        scanned_indices: Final = tuple(index for index, text in enumerate(texts) if text in unseen_texts)
         try:
-            inputs["texts"] = (
-                [self._unmask_pii_text(text, pii_tokens) for text in texts]
-                if unmask_response
-                else list(
-                    await asyncio.gather(
-                        *(
-                            self.check_pii(
-                                text=text,
-                                output_parse_pii=self.output_parse_pii,
-                                presidio_config=None,
-                                request_data=request_data or {},
-                            )
-                            for text in texts
-                        )
+            scanned: Final = await asyncio.gather(
+                *(
+                    self.check_pii(
+                        text=texts[index],
+                        output_parse_pii=self.output_parse_pii,
+                        presidio_config=None,
+                        request_data=request_data,
                     )
+                    for index in scanned_indices
                 )
             )
         finally:
-            if texts and not unmask_response:
+            if scanned_indices:
                 self.mark_guardrail_information_recorded()
-        return inputs
+        results: Final = dict(zip(scanned_indices, scanned))
+        if unseen is not None:
+            await self.mark_texts_scanned(
+                texts=[texts[index] for index, result in results.items() if result == texts[index]],
+                request_data=request_data,
+                cache=cache,
+            )
+        return tuple(results.get(index, text) for index, text in enumerate(texts))
+
+    def supports_only_scan_new_messages(self) -> bool:
+        return not self.output_parse_pii
+
+    def _warn_if_only_scan_new_messages_unsupported(self) -> None:
+        if self.only_scan_new_messages and not self.supports_only_scan_new_messages():
+            verbose_proxy_logger.warning(
+                "Guardrail %s: only_scan_new_messages is not supported with output_parse_pii, scanning the full context.",
+                self.guardrail_name,
+            )
+
+    def _incremental_scan_policy_fingerprint(self) -> str:
+        policy: Final = (
+            self.pii_entities_config,
+            self.presidio_score_thresholds,
+            sorted(self.presidio_entities_deny_list or ()),
+            self.presidio_language,
+            self.ad_hoc_recognizers,
+            self.presidio_analyze_chunk_size_bytes,
+        )
+        return hashlib.sha256(json.dumps(policy, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
 
     def update_in_memory_litellm_params(self, litellm_params: LitellmParams) -> None:
         """
@@ -1775,6 +1817,7 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         super().update_in_memory_litellm_params(litellm_params)
         if self.apply_to_output:
             self.output_parse_pii = False
+        self._warn_if_only_scan_new_messages_unsupported()
         if litellm_params.pii_entities_config:
             self.pii_entities_config = litellm_params.pii_entities_config
         if litellm_params.presidio_score_thresholds:

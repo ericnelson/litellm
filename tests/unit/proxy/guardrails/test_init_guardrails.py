@@ -235,6 +235,37 @@ def test_initialize_presidio_forwards_analyze_chunk_size_bytes():
     assert initialized[-1].presidio_analyze_chunk_size_bytes == 250_000
 
 
+def test_initialize_presidio_forwards_only_scan_new_messages_to_the_scan_callback_only():
+    import litellm
+    from litellm.proxy.guardrails.guardrail_hooks.presidio import (
+        OPTIONAL_PresidioPIIMasking,
+    )
+
+    test_guardrail = {
+        "guardrail_name": "test_presidio_only_scan_new_messages",
+        "litellm_params": {
+            "guardrail": SupportedGuardrailIntegrations.PRESIDIO.value,
+            "mode": "pre_call",
+            "presidio_analyzer_api_base": "https://fakelink.com/v1/presidio/analyze",
+            "presidio_anonymizer_api_base": "https://fakelink.com/v1/presidio/anonymize",
+            "output_parse_pii": True,
+            "presidio_filter_scope": "both",
+            "only_scan_new_messages": True,
+        },
+    }
+
+    InMemoryGuardrailHandler().initialize_guardrail(guardrail=test_guardrail)
+
+    callbacks = [
+        callback
+        for callback in litellm.callbacks
+        if isinstance(callback, OPTIONAL_PresidioPIIMasking)
+        and callback.guardrail_name == "test_presidio_only_scan_new_messages"
+    ]
+    assert len(callbacks) == 3
+    assert [callback._callback_role for callback in callbacks if callback.only_scan_new_messages] == ["scan"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mode, filter_scope, expect_output_scanned",
