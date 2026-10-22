@@ -9,6 +9,7 @@
 
 
 import asyncio
+import hashlib
 import json
 import re
 import threading
@@ -29,6 +30,7 @@ from litellm.constants import (
     DEFAULT_PRESIDIO_ANALYZE_CHUNK_SIZE_BYTES,
     PRESIDIO_ANALYZE_CHUNK_CONCURRENCY,
     PRESIDIO_ANALYZE_CHUNK_OVERLAP_CHARS,
+    PRESIDIO_MAX_CONCURRENT_REQUESTS,
 )
 from litellm.litellm_core_utils.core_helpers import attribute_items, attribute_or_none
 from litellm.types.utils import GenericGuardrailAPIInputs
@@ -99,6 +101,10 @@ def _write_attribute(target: object, name: str, value: object) -> None:
 
 
 _LoopSemaphores = dict[asyncio.AbstractEventLoop, asyncio.Semaphore]
+
+
+def _new_analyzer_session() -> aiohttp.ClientSession:
+    return aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=PRESIDIO_MAX_CONCURRENT_REQUESTS))
 
 
 def _json_escaped_len(text: str) -> int:
@@ -229,6 +235,7 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         self.output_parse_pii = output_parse_pii or False
         self.apply_to_output = apply_to_output
         self._callback_role = _callback_role
+        self._warn_if_only_scan_new_messages_unsupported()
 
         # When output_parse_pii or apply_to_output is enabled, the guardrail must
         # also run on post_call to unmask/mask the response.  Expand the event_hook
@@ -246,9 +253,6 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         self.presidio_analyze_chunk_size_bytes: int = self._coerce_analyze_chunk_size(presidio_analyze_chunk_size_bytes)
         # Shared HTTP session to prevent memory leaks (issue #14540)
         self._http_session: aiohttp.ClientSession | None = None
-        # Lock to prevent race conditions when creating session under concurrent load
-        # Note: asyncio.Lock() can be created without an event loop; it only needs one when awaited
-        self._session_lock: asyncio.Lock = asyncio.Lock()
 
         # Track main thread ID to safely identity when we are running in main loop vs background thread
 
@@ -323,7 +327,7 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
 
         Logic:
         1. If running in the main thread (where the object was initialized/destined to live normally),
-           use the shared `self._http_session` (protected by a lock).
+           use the shared `self._http_session`.
         2. If running in a background thread (e.g. logging hook), use a cached session for that loop.
         """
         current_loop: Final = asyncio.get_running_loop()
@@ -331,16 +335,15 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         # Check if we are in the stored main thread
         if threading.get_ident() == self._main_thread_id:
             # Main thread -> use shared session
-            async with self._session_lock:
-                if self._http_session is None or self._http_session.closed:
-                    self._http_session = aiohttp.ClientSession()
-                yield self._http_session
+            if self._http_session is None or self._http_session.closed:
+                self._http_session = _new_analyzer_session()
+            yield self._http_session
         else:
             # Background thread/loop -> use loop-bound session cache
             # This avoids "attached to a different loop" or "no running event loop" errors
             # when accessing the shared session created in the main loop
             if current_loop not in self._loop_sessions or self._loop_sessions[current_loop].closed:
-                self._loop_sessions[current_loop] = aiohttp.ClientSession()
+                self._loop_sessions[current_loop] = _new_analyzer_session()
             yield self._loop_sessions[current_loop]
 
     async def _close_http_session(self) -> None:
@@ -583,9 +586,7 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         # The semaphore is shared per event loop across every chunked call on
         # this instance, so many oversized blocks in one request (or many
         # concurrent requests) still hold at most this many analyzer calls in
-        # flight. On the proxy's main thread the shared-session lock in
-        # _get_session_iterator additionally serializes the HTTP calls; the
-        # bound matters for loop-bound sessions (background threads).
+        # flight.
         analyze_semaphore: Final = self._get_chunk_semaphore()
 
         async def _analyze_chunk_bounded(
@@ -1740,26 +1741,74 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         texts: Final = inputs.get("texts", [])
 
         metadata: Final = (request_data.get("metadata") or {}) if request_data else {}
-        pii_tokens: Final = metadata.get("pii_tokens", {})
+        pii_tokens: Final = cast("dict[str, str]", metadata.get("pii_tokens", {}))  # cast-ok: this hook's map
 
-        new_texts: Final = []
-        if input_type == "response" and (
+        unmask_response: Final = input_type == "response" and (
             self._callback_role == "restore"
-            or (self._callback_role is None and not self.apply_to_output and pii_tokens)
-        ):
-            for text in texts:
-                new_texts.append(self._unmask_pii_text(text, pii_tokens))
-        else:
-            for text in texts:
-                modified_text = await self.check_pii(
-                    text=text,
-                    output_parse_pii=self.output_parse_pii,
-                    presidio_config=None,
-                    request_data=request_data or {},
-                )
-                new_texts.append(modified_text)
-        inputs["texts"] = new_texts
+            or (self._callback_role is None and not self.apply_to_output and bool(pii_tokens))
+        )
+        inputs["texts"] = (
+            [self._unmask_pii_text(text, pii_tokens) for text in texts]
+            if unmask_response
+            else list(await self._scan_texts(texts=texts, request_data=request_data or {}, input_type=input_type))
+        )
         return inputs
+
+    async def _scan_texts(
+        self, texts: Sequence[str], request_data: dict[str, object], input_type: Literal["request", "response"]
+    ) -> tuple[str, ...]:
+        cache: Final = self._incremental_scan_cache()
+        unseen: Final = (
+            await self.filter_new_texts_for_session(texts=texts, request_data=request_data, cache=cache)
+            if input_type == "request" and self.supports_only_scan_new_messages()
+            else None
+        )
+        unseen_texts: Final = frozenset(texts if unseen is None else unseen)
+        scanned_indices: Final = tuple(index for index, text in enumerate(texts) if text in unseen_texts)
+        try:
+            scanned: Final = await asyncio.gather(
+                *(
+                    self.check_pii(
+                        text=texts[index],
+                        output_parse_pii=self.output_parse_pii,
+                        presidio_config=None,
+                        request_data=request_data,
+                    )
+                    for index in scanned_indices
+                )
+            )
+        finally:
+            if scanned_indices:
+                self.mark_guardrail_information_recorded()
+        results: Final = dict(zip(scanned_indices, scanned))
+        if unseen is not None:
+            await self.mark_texts_scanned(
+                texts=[texts[index] for index, result in results.items() if result == texts[index]],
+                request_data=request_data,
+                cache=cache,
+            )
+        return tuple(results.get(index, text) for index, text in enumerate(texts))
+
+    def supports_only_scan_new_messages(self) -> bool:
+        return not self.output_parse_pii
+
+    def _warn_if_only_scan_new_messages_unsupported(self) -> None:
+        if self.only_scan_new_messages and not self.supports_only_scan_new_messages():
+            verbose_proxy_logger.warning(
+                "Guardrail %s: only_scan_new_messages is not supported with output_parse_pii, scanning the full context.",
+                self.guardrail_name,
+            )
+
+    def _incremental_scan_policy_fingerprint(self) -> str:
+        policy: Final = (
+            self.pii_entities_config,
+            self.presidio_score_thresholds,
+            sorted(self.presidio_entities_deny_list or ()),
+            self.presidio_language,
+            self.ad_hoc_recognizers,
+            self.presidio_analyze_chunk_size_bytes,
+        )
+        return hashlib.sha256(json.dumps(policy, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
 
     def update_in_memory_litellm_params(self, litellm_params: LitellmParams) -> None:
         """
@@ -1768,6 +1817,7 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         super().update_in_memory_litellm_params(litellm_params)
         if self.apply_to_output:
             self.output_parse_pii = False
+        self._warn_if_only_scan_new_messages_unsupported()
         if litellm_params.pii_entities_config:
             self.pii_entities_config = litellm_params.pii_entities_config
         if litellm_params.presidio_score_thresholds:

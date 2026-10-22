@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import re
+import uuid
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -26,6 +27,7 @@ from typing_extensions import ReadOnly, TypedDict
 import litellm
 from litellm import mock_completion
 from litellm.caching.caching import DualCache
+from litellm.constants import DEFAULT_PRESIDIO_ANALYZE_CHUNK_SIZE_BYTES, PRESIDIO_MAX_CONCURRENT_REQUESTS
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.guardrails.guardrail_hooks.presidio import (
     PresidioPerRequestConfig,
@@ -4702,11 +4704,15 @@ def _drain(analyzed: asyncio.Queue[PresidioAnalyzeRequest]) -> tuple[PresidioAna
 
 def _guardrail_with_in_memory_presidio(
     analyzed: asyncio.Queue[PresidioAnalyzeRequest],
+    only_scan_new_messages: bool = False,
+    output_parse_pii: bool = False,
 ) -> OPTIONAL_PresidioPIIMasking:
     guardrail: Final = OPTIONAL_PresidioPIIMasking(
         pii_entities_config=_BLOCK_CARD_MASK_EMAIL,
         presidio_analyzer_api_base="http://presidio-analyzer.test/",
         presidio_anonymizer_api_base="http://presidio-anonymizer.test/",
+        only_scan_new_messages=only_scan_new_messages,
+        output_parse_pii=output_parse_pii,
     )
     guardrail._http_session = aiohttp.ClientSession(connector=_InMemoryPresidioConnector(analyzed))
     return guardrail
@@ -4830,3 +4836,350 @@ def test_get_session_iterator_reuses_one_session_per_background_loop(
     assert len(sessions) == 10
     assert all(session is sessions[0] for session in sessions)
     assert presidio_guardrail._http_session is None
+
+
+class _GatedAnalyzer:
+    """Holds every /analyze request until released, recording how many were open at once."""
+
+    def __init__(self, saturation: int) -> None:
+        self._saturation: Final = saturation
+        self.open_requests = 0
+        self.peak_open_requests = 0
+        self.saturated: Final = asyncio.Event()
+        self.release: Final = asyncio.Event()
+
+    async def analyze(self, request: web.Request) -> web.Response:
+        self.open_requests += 1
+        self.peak_open_requests = max(self.peak_open_requests, self.open_requests)
+        if self.open_requests >= self._saturation:
+            self.saturated.set()
+        await self.release.wait()
+        self.open_requests -= 1
+        return web.json_response([])
+
+
+@pytest.mark.asyncio
+async def test_analyze_requests_run_concurrently_up_to_the_connection_limit() -> None:
+    limit: Final = PRESIDIO_MAX_CONCURRENT_REQUESTS
+    analyzer: Final = _GatedAnalyzer(saturation=limit)
+    app: Final = web.Application()
+    app.router.add_post("/analyze", analyzer.analyze)
+    async with TestServer(app) as server:
+        guardrail: Final = OPTIONAL_PresidioPIIMasking(
+            presidio_analyzer_api_base=str(server.make_url("/")),
+            presidio_anonymizer_api_base=str(server.make_url("/")),
+            pii_entities_config={PiiEntityType.PERSON: PiiAction.MASK},
+        )
+        scans: Final = tuple(
+            asyncio.create_task(guardrail.analyze_text(text=f"message {index}", presidio_config=None, request_data={}))
+            for index in range(limit * 3)
+        )
+        await asyncio.wait_for(analyzer.saturated.wait(), timeout=30)
+        for _ in range(100):
+            await asyncio.sleep(0)
+        analyzer.release.set()
+        await asyncio.gather(*scans)
+        await guardrail._close_http_session()
+
+    assert analyzer.peak_open_requests == limit
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_scans_texts_concurrently() -> None:
+    texts: Final = ["first message", "second message", "third message"]
+    analyzer: Final = _GatedAnalyzer(saturation=len(texts))
+    app: Final = web.Application()
+    app.router.add_post("/analyze", analyzer.analyze)
+    async with TestServer(app) as server:
+        guardrail: Final = OPTIONAL_PresidioPIIMasking(
+            presidio_analyzer_api_base=str(server.make_url("/")),
+            presidio_anonymizer_api_base=str(server.make_url("/")),
+            pii_entities_config={PiiEntityType.PERSON: PiiAction.MASK},
+        )
+        scan: Final = asyncio.create_task(
+            guardrail.apply_guardrail(
+                inputs={"texts": list(texts)}, request_data={"model": "gpt-5-mini"}, input_type="request"
+            )
+        )
+        await asyncio.wait_for(analyzer.saturated.wait(), timeout=30)
+        analyzer.release.set()
+        result: Final = await scan
+        await guardrail._close_http_session()
+
+    assert result["texts"] == texts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("texts", "blocked", "recorded_entries"),
+    [
+        pytest.param(("one", "two", "three"), False, 3, id="each_scan_is_recorded_once"),
+        pytest.param((f"card {_CARD_NUMBER}",), True, 1, id="a_blocked_scan_is_recorded_once"),
+        pytest.param((), False, 1, id="no_scans_keep_the_single_default_entry"),
+    ],
+)
+async def test_apply_guardrail_records_one_entry_per_scan(
+    texts: tuple[str, ...], blocked: bool, recorded_entries: int
+) -> None:
+    analyzed: Final[asyncio.Queue[PresidioAnalyzeRequest]] = asyncio.Queue()
+    guardrail: Final = _guardrail_with_in_memory_presidio(analyzed)
+    request_data: Final = {"model": "gpt-5-mini"}
+    try:
+        scan: Final = guardrail.apply_guardrail(
+            inputs={"texts": list(texts)}, request_data=request_data, input_type="request"
+        )
+        if blocked:
+            with pytest.raises(BlockedPiiEntityError):
+                await scan
+        else:
+            await scan
+    finally:
+        await guardrail._close_http_session()
+
+    assert len(request_data["metadata"]["standard_logging_guardrail_information"]) == recorded_entries
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_restoring_a_response_keeps_the_single_default_entry() -> None:
+    guardrail: Final = OPTIONAL_PresidioPIIMasking(
+        mock_testing=True,
+        pii_entities_config={PiiEntityType.PERSON: PiiAction.MASK},
+        _callback_role="restore",
+    )
+    request_data: Final = {"model": "gpt-5-mini", "metadata": {"pii_tokens": {"<PERSON_1>": "John Smith"}}}
+
+    result: Final = await guardrail.apply_guardrail(
+        inputs={"texts": ["Hello <PERSON_1>"]}, request_data=request_data, input_type="response"
+    )
+
+    assert result["texts"] == ["Hello John Smith"]
+    assert len(request_data["metadata"]["standard_logging_guardrail_information"]) == 1
+
+
+@pytest.fixture
+def session_id() -> str:
+    return f"session-{uuid.uuid4().hex}"
+
+
+async def _request_turn(
+    guardrail: OPTIONAL_PresidioPIIMasking,
+    texts: Sequence[str],
+    session: str | None,
+    input_type: Literal["request", "response"] = "request",
+) -> dict:
+    request_data: Final = {"model": "gpt-5-mini", **({} if session is None else {"litellm_session_id": session})}
+    return await guardrail.apply_guardrail(
+        inputs={"texts": list(texts)}, request_data=request_data, input_type=input_type
+    )
+
+
+def _scanned_texts(analyzed: asyncio.Queue[PresidioAnalyzeRequest]) -> list[str]:
+    return sorted(payload.get("text") or "" for payload in _drain(analyzed))
+
+
+@pytest.mark.asyncio
+async def test_only_scan_new_messages_scans_only_unseen_segments_each_turn(session_id: str) -> None:
+    analyzed: Final[asyncio.Queue[PresidioAnalyzeRequest]] = asyncio.Queue()
+    guardrail: Final = _guardrail_with_in_memory_presidio(analyzed, only_scan_new_messages=True)
+    try:
+        await _request_turn(guardrail, ["system prompt", "first question"], session_id)
+        first_turn: Final = _scanned_texts(analyzed)
+        await _request_turn(
+            guardrail, ["system prompt", "first question", "first answer", "second question"], session_id
+        )
+        second_turn: Final = _scanned_texts(analyzed)
+        await _request_turn(
+            guardrail, ["system prompt", "first question edited", "first answer", "second question"], session_id
+        )
+        edited_turn: Final = _scanned_texts(analyzed)
+    finally:
+        await guardrail._close_http_session()
+
+    assert first_turn == ["first question", "system prompt"]
+    assert second_turn == ["first answer", "second question"]
+    assert edited_turn == ["first question edited"]
+
+
+@pytest.mark.asyncio
+async def test_only_scan_new_messages_scans_duplicate_segments_once_cached(session_id: str) -> None:
+    analyzed: Final[asyncio.Queue[PresidioAnalyzeRequest]] = asyncio.Queue()
+    guardrail: Final = _guardrail_with_in_memory_presidio(analyzed, only_scan_new_messages=True)
+    try:
+        await _request_turn(guardrail, ["same", "same"], session_id)
+        first_turn: Final = _scanned_texts(analyzed)
+        await _request_turn(guardrail, ["same", "same", "new"], session_id)
+        second_turn: Final = _scanned_texts(analyzed)
+    finally:
+        await guardrail._close_http_session()
+
+    assert first_turn == ["same", "same"]
+    assert second_turn == ["new"]
+
+
+@pytest.mark.asyncio
+async def test_only_scan_new_messages_rescans_a_blocked_turn_on_retry(session_id: str) -> None:
+    blocked_turn: Final = ["clean sibling", f"card {_CARD_NUMBER}"]
+    analyzed: Final[asyncio.Queue[PresidioAnalyzeRequest]] = asyncio.Queue()
+    guardrail: Final = _guardrail_with_in_memory_presidio(analyzed, only_scan_new_messages=True)
+    try:
+        with pytest.raises(BlockedPiiEntityError):
+            await _request_turn(guardrail, blocked_turn, session_id)
+        _drain(analyzed)
+        with pytest.raises(BlockedPiiEntityError):
+            await _request_turn(guardrail, blocked_turn, session_id)
+        retry: Final = _scanned_texts(analyzed)
+    finally:
+        await guardrail._close_http_session()
+
+    assert retry == sorted(blocked_turn)
+
+
+@pytest.mark.asyncio
+async def test_only_scan_new_messages_does_not_share_state_across_sessions_or_without_one(session_id: str) -> None:
+    texts: Final = ["one", "two"]
+    analyzed: Final[asyncio.Queue[PresidioAnalyzeRequest]] = asyncio.Queue()
+    guardrail: Final = _guardrail_with_in_memory_presidio(analyzed, only_scan_new_messages=True)
+    try:
+        await _request_turn(guardrail, texts, session_id)
+        _drain(analyzed)
+        await _request_turn(guardrail, texts, f"{session_id}-other")
+        other_session: Final = _scanned_texts(analyzed)
+        await _request_turn(guardrail, texts, session_id)
+        same_session_again: Final = _scanned_texts(analyzed)
+        await _request_turn(guardrail, texts, None)
+        await _request_turn(guardrail, texts, None)
+        without_session: Final = _scanned_texts(analyzed)
+    finally:
+        await guardrail._close_http_session()
+
+    assert other_session == texts
+    assert same_session_again == []
+    assert without_session == sorted([*texts, *texts])
+
+
+@pytest.mark.asyncio
+async def test_only_scan_new_messages_never_skips_response_texts(session_id: str) -> None:
+    analyzed: Final[asyncio.Queue[PresidioAnalyzeRequest]] = asyncio.Queue()
+    guardrail: Final = _guardrail_with_in_memory_presidio(analyzed, only_scan_new_messages=True)
+    try:
+        await _request_turn(guardrail, ["model answer"], session_id, input_type="response")
+        await _request_turn(guardrail, ["model answer"], session_id, input_type="response")
+        scanned: Final = _scanned_texts(analyzed)
+    finally:
+        await guardrail._close_http_session()
+
+    assert scanned == ["model answer", "model answer"]
+
+
+@pytest.mark.asyncio
+async def test_only_scan_new_messages_records_one_entry_when_every_segment_is_cached(session_id: str) -> None:
+    analyzed: Final[asyncio.Queue[PresidioAnalyzeRequest]] = asyncio.Queue()
+    guardrail: Final = _guardrail_with_in_memory_presidio(analyzed, only_scan_new_messages=True)
+    request_data: Final = {"model": "gpt-5-mini", "litellm_session_id": session_id}
+    try:
+        await _request_turn(guardrail, ["one", "two"], session_id)
+        await guardrail.apply_guardrail(
+            inputs={"texts": ["one", "two"]}, request_data=request_data, input_type="request"
+        )
+    finally:
+        await guardrail._close_http_session()
+
+    assert len(request_data["metadata"]["standard_logging_guardrail_information"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_only_scan_new_messages_scans_everything_and_warns_with_output_parse_pii(session_id: str) -> None:
+    texts: Final = ["one", "two"]
+    analyzed: Final[asyncio.Queue[PresidioAnalyzeRequest]] = asyncio.Queue()
+    with patch("litellm.proxy.guardrails.guardrail_hooks.presidio.verbose_proxy_logger") as mock_logger:
+        guardrail: Final = _guardrail_with_in_memory_presidio(
+            analyzed, only_scan_new_messages=True, output_parse_pii=True
+        )
+    try:
+        await _request_turn(guardrail, texts, session_id)
+        await _request_turn(guardrail, texts, session_id)
+        scanned: Final = _scanned_texts(analyzed)
+    finally:
+        await guardrail._close_http_session()
+
+    assert scanned == sorted([*texts, *texts])
+    assert mock_logger.warning.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("policy_change", "rescanned"),
+    [
+        pytest.param({}, False, id="the_same_policy_keeps_the_session_cache"),
+        pytest.param({"pii_entities_config": {PiiEntityType.CREDIT_CARD: PiiAction.BLOCK}}, True, id="entities"),
+        pytest.param({"presidio_score_thresholds": {PiiEntityType.CREDIT_CARD: 0.9}}, True, id="score_thresholds"),
+        pytest.param({"presidio_entities_deny_list": [PiiEntityType.EMAIL_ADDRESS]}, True, id="deny_list"),
+    ],
+)
+async def test_only_scan_new_messages_rescans_the_session_when_the_policy_changes(
+    session_id: str, policy_change: dict, rescanned: bool
+) -> None:
+    texts: Final = ["one", "two"]
+    analyzed: Final[asyncio.Queue[PresidioAnalyzeRequest]] = asyncio.Queue()
+    guardrail: Final = _guardrail_with_in_memory_presidio(analyzed, only_scan_new_messages=True)
+    try:
+        await _request_turn(guardrail, texts, session_id)
+        _drain(analyzed)
+        guardrail.update_in_memory_litellm_params(
+            LitellmParams(
+                guardrail="presidio",
+                mode="pre_call",
+                only_scan_new_messages=True,
+                **{
+                    "pii_entities_config": _BLOCK_CARD_MASK_EMAIL,
+                    "presidio_score_thresholds": {},
+                    "presidio_entities_deny_list": [],
+                    "presidio_language": "en",
+                    "presidio_analyzer_api_base": "http://presidio-analyzer.test/",
+                    "presidio_anonymizer_api_base": "http://presidio-anonymizer.test/",
+                    "presidio_analyze_chunk_size_bytes": DEFAULT_PRESIDIO_ANALYZE_CHUNK_SIZE_BYTES,
+                    **policy_change,
+                },
+            )
+        )
+        await _request_turn(guardrail, texts, session_id)
+        scanned: Final = _scanned_texts(analyzed)
+    finally:
+        await guardrail._close_http_session()
+
+    assert scanned == (texts if rescanned else [])
+
+
+def _recording_presidio_app(analyzed: list[str]) -> web.Application:
+    async def analyze(request: web.Request) -> web.Response:
+        payload: Final = await request.json()
+        analyzed.append(payload["text"])
+        return web.json_response(_person_spans(payload["text"]))
+
+    app: Final = web.Application()
+    app.router.add_post("/analyze", analyze)
+    app.router.add_post("/anonymize", _fake_anonymize)
+    return app
+
+
+@pytest.mark.asyncio
+async def test_only_scan_new_messages_masks_personal_segments_on_every_turn(session_id: str) -> None:
+    analyzed: Final[list[str]] = []
+    async with TestServer(_recording_presidio_app(analyzed)) as server:
+        guardrail: Final = OPTIONAL_PresidioPIIMasking(
+            presidio_analyzer_api_base=str(server.make_url("/")),
+            presidio_anonymizer_api_base=str(server.make_url("/")),
+            pii_entities_config={PiiEntityType.PERSON: PiiAction.MASK},
+            only_scan_new_messages=True,
+        )
+        first_turn: Final = await _request_turn(guardrail, ["my name is John Smith", "plain note"], session_id)
+        analyzed.clear()
+        second_turn: Final = await _request_turn(
+            guardrail, ["my name is John Smith", "plain note", "call Alice Brown later"], session_id
+        )
+        second_turn_scans: Final = sorted(analyzed)
+        await guardrail._close_http_session()
+
+    assert first_turn["texts"] == ["my name is <PERSON>", "plain note"]
+    assert second_turn["texts"] == ["my name is <PERSON>", "plain note", "call <PERSON> later"]
+    assert second_turn_scans == ["call Alice Brown later", "my name is John Smith"]
